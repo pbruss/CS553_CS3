@@ -4,13 +4,23 @@ import torch
 import time
 import psutil  # Import psutil to track CPU memory usage
 from transformers import pipeline
-from prometheus_client import start_http_server, Counter, Summary
+from prometheus_client import start_http_server, Counter, Summary, Gauge
 
 # Prometheus metrics
 REQUEST_COUNTER = Counter('app_requests_total', 'Total number of requests')
 SUCCESSFUL_REQUESTS = Counter('app_successful_requests_total', 'Total number of successful requests')
 FAILED_REQUESTS = Counter('app_failed_requests_total', 'Total number of failed requests')
 REQUEST_DURATION = Summary('app_request_duration_seconds', 'Time spent processing request')
+
+# Additional Prometheus metrics
+TOKEN_COUNT = Summary('app_token_count', 'Number of tokens generated per response')
+LOCAL_MODEL_USAGE = Counter('app_local_model_usage', 'Number of times the local model was used')
+API_MODEL_USAGE = Counter('app_api_model_usage', 'Number of times the API model was used')
+
+# Error type counters
+TIMEOUT_ERRORS = Counter('app_timeout_errors_total', 'Total number of timeout errors')
+API_ERRORS = Counter('app_api_errors_total', 'Total number of API errors')
+UNKNOWN_ERRORS = Counter('app_unknown_errors_total', 'Total number of unknown errors')
 
 # Inference client setup
 client = InferenceClient("HuggingFaceH4/zephyr-7b-beta")
@@ -44,6 +54,9 @@ def respond(
             history = []
         
         if use_local_model:
+            # Increment local model usage counter
+            LOCAL_MODEL_USAGE.inc()
+            
             # local inference 
             messages = [{"role": "system", "content": system_message}]
             for val in history:
@@ -54,7 +67,7 @@ def respond(
             messages.append({"role": "user", "content": message})
             
             response = ""
-            
+            token_count = 0
             for output in pipe(
                 messages,
                 max_new_tokens=max_tokens,
@@ -68,9 +81,14 @@ def respond(
                     return
                 token = output['generated_text'][-1]['content']
                 response += token
+                token_count += 1
                 yield history + [(message, response)]  # Yield history + new response
+            TOKEN_COUNT.observe(token_count)  # Record token count
                 
         else:
+            # Increment API model usage counter
+            API_MODEL_USAGE.inc()
+            
             # API-based inference 
             messages = [{"role": "system", "content": system_message}]
             for val in history:
@@ -81,6 +99,7 @@ def respond(
             messages.append({"role": "user", "content": message})
             
             response = ""
+            token_count = 0
             for message_chunk in client.chat_completion(
                 messages,
                 max_tokens=max_tokens,
@@ -98,11 +117,25 @@ def respond(
                 
                 token = message_chunk.choices[0].delta.content
                 response += token
+                token_count += 1
                 yield history + [(message, response)]  # Yield history + new response
+            TOKEN_COUNT.observe(token_count)  # Record token count
             
             SUCCESSFUL_REQUESTS.inc()  # Increment successful request counter
+    
+    except TimeoutError as e:
+        TIMEOUT_ERRORS.inc()
+        FAILED_REQUESTS.inc()  # Increment failed request counter
+        yield history + [(message, f"Timeout Error: {str(e)}")]
+    
     except Exception as e:
         FAILED_REQUESTS.inc()  # Increment failed request counter
+        
+        if "API" in str(e):
+            API_ERRORS.inc()
+        else:
+            UNKNOWN_ERRORS.inc()
+        
         yield history + [(message, f"Error: {str(e)}")]
     finally:
         request_timer.observe_duration()  # Stop timing the request
